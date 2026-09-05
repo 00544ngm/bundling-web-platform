@@ -28,6 +28,10 @@ class BackendSettings(BaseSettings):
     provider_key_file: Path = Path("backend/.api-config.key")
     desktop_session_token: str | None = None
     desktop_database_path: Path | None = None
+    # Allow the provider/API settings endpoints to be reached from remote
+    # clients (e.g. managing a server deployment from another machine).
+    # Default False keeps the original "localhost only" security posture.
+    allow_remote_settings: bool = False
 
 
 @lru_cache

@@ -163,6 +163,27 @@ async def test_provider_settings_reject_non_loopback_clients():
 
 
 @pytest.mark.asyncio
+async def test_provider_settings_allow_remote_when_flag_enabled(monkeypatch):
+    import backend.config as config_module
+
+    class _Settings:
+        allow_remote_settings = True
+
+    monkeypatch.setattr(config_module, "get_backend_settings", lambda: _Settings())
+
+    service = AsyncMock()
+    app = create_app()
+    app.dependency_overrides[get_provider_service] = lambda: service
+
+    transport = ASGITransport(app=app, client=("203.0.113.8", 32000))
+    async with AsyncClient(transport=transport, base_url="http://example.com") as client:
+        response = await client.get("/api/v1/settings/providers")
+
+    assert response.status_code == 200
+    service.list_public.assert_awaited_once()
+
+
+@pytest.mark.asyncio
 async def test_provider_model_verify_endpoint_returns_per_model_status():
     service = AsyncMock()
     service.verify_model.return_value = ProviderModelVerifyResult(

@@ -43,33 +43,34 @@ git clone https://github.com/00544ngm/bundling-web-platform.git /opt/bundling
 cd /opt/bundling
 ```
 
-## 4. 配置环境变量（单文件 .env，systemd 用 EnvironmentFile 加载进进程环境）
+## 4. 配置环境变量（两套配置，务必分开两个文件）
 
+项目有**两套 pydantic 配置**，别混在一个文件里，否则旧 `app.core.config.Settings`（`extra=forbid`）会因不认识的键启动报错：
+
+**① 根目录 `/opt/bundling/.env`** —— 只放旧版/模型/浏览器引导键（app 旧配置读它）：
 ```bash
 cp .env.example .env
 nano .env
+# 内容即 .env.example：OPENAI/DEEPSEEK/CATTOKEN 的 KEY/MODEL/BASE_URL、HEADLESS、BROWSER_WS_ENDPOINT、CAPTCHA_* 等
+# 注意：绝不要在这里放 DATABASE_URL / REDIS_URL / CORS_ORIGINS / ALLOW_REMOTE_SETTINGS / PROVIDER_* ——会触发 extra_forbidden
 ```
 
-`.env` 里至少要确认/修改（`backend/config.py` 与 `app` 旧配置都从进程环境读取，两个都能覆盖）：
-
+**② `/opt/bundling/backend/.env`** —— 后端 `BackendSettings` 读它：
 ```bash
-# 后端数据库 / Redis（backend 的 BackendSettings 用这些字段名）
+nano backend/.env
+```
+内容：
+```bash
 DATABASE_URL=postgresql+asyncpg://bundling:bundling@127.0.0.1:5432/bundling
 REDIS_URL=redis://127.0.0.1:6379/0
+RUNTIME_MODE=server
 
-# 浏览器访问用的源（如果用 服务器IP:3000 或域名访问前端，必须放开，否则 CORS 拦）
-CORS_ORIGINS=["http://服务器IP:3000","http://你的域名"]
+# 浏览器访问用的源（用 服务器IP:3000 或域名访问前端时必须包含该源，否则 CORS 拦）
+CORS_ORIGINS=["http://服务器IP:3000","http://localhost:3000"]
 
-# 旧版 provider 引导（可选，仅当库里没有该 provider 配置时导入；之后在 UI 管理）
-OPENAI_API_KEY=sk-...
-DEEPSEEK_API_KEY=sk-...
-CATTOKEN_API_KEY=sk-...
-
-# 浏览器
-HEADLESS=true
-BROWSER_WS_ENDPOINT=
-CAPTCHA_WAIT_ENABLED=true
-CAPTCHA_WAIT_TIMEOUT_SECONDS=600
+# 是否允许远程管理 API/模型设置。默认 false = 仅本机可改 provider（单机安全设计）。
+# 服务器部署、要从别处浏览器改 API 设置时设 true。改后需重启 bundling-api。
+ALLOW_REMOTE_SETTINGS=true
 
 # Provider 密钥加密（Fernet）。留空则后端自动生成 backend/.api-config.key
 # 请把 backend/.api-config.key 与 PostgreSQL 数据一起备份，丢了就无法解库里存的 Key。
@@ -77,7 +78,7 @@ PROVIDER_ENCRYPTION_KEY=
 PROVIDER_KEY_FILE=backend/.api-config.key
 ```
 
-> provider 的 API Key 主要在上线后 http://IP:3000/settings/api 里录入保存，`.env` 只做首次引导。
+> systemd 的 api/worker 单元 `EnvironmentFile=/opt/bundling/.env` 只用于旧配置引导键；后端键由各自 env_file 读取，无需全部注入 OS 环境。
 
 ## 5. 装依赖 + 前端构建
 
