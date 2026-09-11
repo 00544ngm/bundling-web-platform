@@ -92,6 +92,8 @@ async def run_analysis_job(ctx: dict, job_id: str) -> dict | None:
             requested_model = job_data.pop("model", None)
             requested_provider = job_data.pop("provider", None) or "openai"
             rotation_enabled = bool(job_data.pop("rotation_enabled", False))
+            # Absent for older submissions, which default to running the stage.
+            include_bundle_plans = bool(job_data.pop("bundle_plans_enabled", True))
             raw_candidates = job_data.pop("rotation_candidates", None)
             candidates = [
                 RotationCandidate(
@@ -221,6 +223,7 @@ async def run_analysis_job(ctx: dict, job_id: str) -> dict | None:
                             product=scraped_products[0],
                             browser_started=True,
                             report_progress=report_progress,
+                            include_bundle_plans=include_bundle_plans,
                         )
                     elif mode == "judgment":
                         stage = "run_judgment"
@@ -250,6 +253,7 @@ async def run_analysis_job(ctx: dict, job_id: str) -> dict | None:
                             products=scraped_products,
                             browser_started=True,
                             report_progress=report_progress,
+                            include_bundle_plans=include_bundle_plans,
                         )
                     if result is None:
                         stage = "parse"

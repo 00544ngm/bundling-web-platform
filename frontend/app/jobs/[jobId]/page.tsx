@@ -447,6 +447,7 @@ export default function JobDetailPage() {
               auditOutcome={activeResult?.audit_outcome}
               rejectionSummary={activeResult?.rejection_summary}
               rejectedBProducts={taskRejectedBProducts}
+              bundlePlans={payload?.bundle_plans}
             />
           )}
         </>

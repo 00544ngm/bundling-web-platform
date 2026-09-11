@@ -8,6 +8,7 @@ import pytest
 
 from app.core.exceptions import (
     BrowserTargetClosedError,
+    LLMError,
     ModelContractError,
     ProductTypeGateError,
 )
@@ -20,6 +21,7 @@ from app.domain.dto import (
 from backend.application.analysis_runner import (
     AnalysisRunner,
     RunnerResult,
+    _attach_bundle_plan_block,
     _build_cross_review_prompt,
     _serialize_b_products,
     _serialize_hypothesis,
@@ -1072,3 +1074,311 @@ async def test_runner_stops_browser_after_failure(
         )
 
     assert browser.stopped
+
+
+# --- instruction C: bundle plans ---------------------------------------------
+
+BUNDLE_CANONICAL = "compatible_filter"
+
+
+def _rated(score: int, reason: str) -> dict[str, Any]:
+    return {"score": score, "reason": reason}
+
+
+def _v21_direction(canonical_name: str = BUNDLE_CANONICAL) -> dict[str, Any]:
+    return {
+        "name_zh": "兼容滤芯",
+        "name_en": "Compatible Filter",
+        "canonical_name": canonical_name,
+        "primary_relation": "consumable_refill",
+        "purchase_direction": "forward_dependency",
+        "lifecycle_stage": "replenish",
+        "consistency": {
+            "user": _rated(4, "同一人群"),
+            "scenario": _rated(4, "同一场景"),
+            "lifecycle": _rated(4, "连续使用"),
+            "mental": _rated(3, "容易理解"),
+        },
+        "consumer_simulation": "A",
+        "consumer_simulation_reason": "自然一起购买",
+        "independent_ratings": {
+            "relation_strength": 5,
+            "repeat_value": 4,
+            "function_gain": 3,
+        },
+    }
+
+
+def _v21_result(directions: list[dict[str, Any]]) -> dict[str, Any]:
+    return {
+        **FakeLLM()._result,
+        "model_version": "combination_model_v2.1",
+        "directions": directions,
+    }
+
+
+def _bundle_stage_payload(canonical_name: str = BUNDLE_CANONICAL) -> dict[str, Any]:
+    return {
+        "stage_version": "bundle_stage_v1",
+        "result_status": "completed",
+        "verdict": "plans_ready",
+        "verdict_statement": "有一组可落地",
+        "plans": [
+            {
+                "rank": "first",
+                "members": [{"canonical_name": canonical_name, "name_zh": "兼容滤芯"}],
+                "bundle_size": 1,
+                "used_direction_names": [canonical_name],
+                "increment_tests": [{"member_name": "兼容滤芯"}],
+                "counterfactuals": [
+                    {"alternative": "main_only"},
+                    {"alternative": "own_existing_supplies"},
+                ],
+            }
+        ],
+        "exploratory_plans": [],
+    }
+
+
+class FakeBundlePlanLLM(FakeLLM):
+    """Dispatches on schema_name, mirroring EvidenceAwareFakeLLM."""
+
+    def __init__(self, result: dict, bundle_result: Any) -> None:
+        super().__init__(result)
+        self._bundle_result = bundle_result
+        self.bundle_calls = 0
+
+    async def chat_structured(
+        self, messages: list[dict], output_schema: dict, **kwargs: Any
+    ) -> dict:
+        if str(kwargs.get("schema_name", "")).startswith("bundle_plan_output"):
+            self.bundle_calls += 1
+            if isinstance(self._bundle_result, Exception):
+                raise self._bundle_result
+            return self._bundle_result
+        return self._result
+
+
+@pytest.mark.asyncio
+async def test_runner_attaches_bundle_plans_built_from_primary_directions(
+    browser: FakeBrowser, store: FakeStore, service_factory: Any
+):
+    llm = FakeBundlePlanLLM(
+        _v21_result([_v21_direction()]), _bundle_stage_payload()
+    )
+
+    result = await AnalysisRunner(store=store).run_hypothesis(
+        url="https://www.walmart.com/ip/test/12345",
+        browser=browser,
+        llm=llm,
+        expected_model_version="combination_model_v2.1",
+        product_service_factory=service_factory,
+    )
+
+    block = result.result_payload["bundle_plans"]
+    assert block["stage_version"] == "bundle_stage_v1"
+    assert block["result_status"] == "completed"
+    assert block["plans"][0]["members"][0]["canonical_name"] == BUNDLE_CANONICAL
+    assert llm.bundle_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_runner_skips_bundle_stage_for_a_legacy_contract(
+    browser: FakeBrowser, store: FakeStore, service_factory: Any
+):
+    """Legacy runs must not pay for an extra model call."""
+    llm = FakeBundlePlanLLM(_v21_result([_v21_direction()]), _bundle_stage_payload())
+
+    result = await AnalysisRunner(store=store).run_hypothesis(
+        url="https://www.walmart.com/ip/test/12345",
+        browser=browser,
+        llm=llm,
+        product_service_factory=service_factory,
+    )
+
+    assert "bundle_plans" not in result.result_payload
+    assert llm.bundle_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_runner_skips_bundle_stage_when_explicitly_disabled(
+    browser: FakeBrowser, store: FakeStore, service_factory: Any
+):
+    llm = FakeBundlePlanLLM(_v21_result([_v21_direction()]), _bundle_stage_payload())
+
+    result = await AnalysisRunner(store=store).run_hypothesis(
+        url="https://www.walmart.com/ip/test/12345",
+        browser=browser,
+        llm=llm,
+        expected_model_version="combination_model_v2.1",
+        product_service_factory=service_factory,
+        include_bundle_plans=False,
+    )
+
+    assert "bundle_plans" not in result.result_payload
+    assert llm.bundle_calls == 0
+
+
+@pytest.mark.asyncio
+async def test_bundle_stage_failure_leaves_the_job_successful(
+    browser: FakeBrowser, store: FakeStore, service_factory: Any
+):
+    llm = FakeBundlePlanLLM(
+        _v21_result([_v21_direction()]), LLMError("provider exploded")
+    )
+
+    result = await AnalysisRunner(store=store).run_hypothesis(
+        url="https://www.walmart.com/ip/test/12345",
+        browser=browser,
+        llm=llm,
+        expected_model_version="combination_model_v2.1",
+        product_service_factory=service_factory,
+    )
+
+    block = result.result_payload["bundle_plans"]
+    assert block["result_status"] == "unavailable"
+    assert block["plans"] == []
+    assert block["unavailable_reason"]
+    assert len(store.saved) == 1
+
+
+@pytest.mark.asyncio
+async def test_bundle_plan_member_that_matches_no_direction_is_dropped(
+    browser: FakeBrowser, store: FakeStore, service_factory: Any
+):
+    llm = FakeBundlePlanLLM(
+        _v21_result([_v21_direction()]), _bundle_stage_payload("invented_product")
+    )
+
+    result = await AnalysisRunner(store=store).run_hypothesis(
+        url="https://www.walmart.com/ip/test/12345",
+        browser=browser,
+        llm=llm,
+        expected_model_version="combination_model_v2.1",
+        product_service_factory=service_factory,
+    )
+
+    block = result.result_payload["bundle_plans"]
+    assert block["plans"] == []
+    assert block["verdict"] == "no_viable_bundle"
+
+
+@pytest.mark.asyncio
+async def test_dual_model_result_keeps_bundle_plans_at_the_top_level_only(
+    browser: FakeBrowser, store: FakeStore, service_factory: Any
+):
+    output = _v21_result([_v21_direction()])
+    llm = FakeBundlePlanLLM(output, _bundle_stage_payload())
+
+    result = await AnalysisRunner(store=store).run_hypothesis(
+        url="https://www.walmart.com/ip/test/12345",
+        browser=browser,
+        llm=llm,
+        llm_secondary=FakeLLM(result=output),
+        expected_model_version="combination_model_v2.1",
+        product_service_factory=service_factory,
+    )
+
+    payload = result.result_payload
+    assert "bundle_plans" in payload
+    assert "bundle_plans" not in payload["models"]["gpt"]
+    assert "bundle_plans" not in payload["models"]["deepseek"]
+    assert llm.bundle_calls == 1
+
+
+@pytest.mark.asyncio
+async def test_batch_attaches_one_bundle_block_per_item(
+    browser: FakeBrowser, store: FakeStore, service_factory: Any
+):
+    llm = FakeBundlePlanLLM(_v21_result([_v21_direction()]), _bundle_stage_payload())
+
+    result = await AnalysisRunner(store=store).run_batch(
+        urls=[
+            "https://www.walmart.com/ip/test/12345",
+            "https://www.walmart.com/ip/test/67890",
+        ],
+        browser=browser,
+        llm=llm,
+        expected_model_version="combination_model_v2.1",
+        product_service_factory=service_factory,
+    )
+
+    items = result.result_payload["results"]
+    assert len(items) == 2
+    for item in items:
+        assert item["bundle_plans"]["result_status"] == "completed"
+    assert llm.bundle_calls == 2
+
+
+@pytest.mark.asyncio
+async def test_batch_bundle_failure_on_one_item_does_not_abort_the_batch(
+    browser: FakeBrowser, store: FakeStore, service_factory: Any
+):
+    llm = FakeBundlePlanLLM(
+        _v21_result([_v21_direction()]), LLMError("provider exploded")
+    )
+
+    result = await AnalysisRunner(store=store).run_batch(
+        urls=["https://www.walmart.com/ip/test/12345"],
+        browser=browser,
+        llm=llm,
+        expected_model_version="combination_model_v2.1",
+        product_service_factory=service_factory,
+    )
+
+    item = result.result_payload["results"][0]
+    assert item["bundle_plans"]["result_status"] == "unavailable"
+    assert item["result_status"] != "failed"
+
+
+def test_invalid_bundle_block_degrades_instead_of_failing_the_job():
+    """A defect in the optional stage must not destroy a valid report."""
+    payload: dict[str, Any] = {}
+    block = {
+        "stage_version": "bundle_stage_v1",
+        "result_status": "completed",
+        "verdict": "plans_ready",
+        "plans": [
+            {
+                "rank": "first",
+                "members": [{"canonical_name": "nowhere", "name_zh": "无"}],
+                "bundle_size": 1,
+                "increment_tests": [],
+                "counterfactuals": [],
+            }
+        ],
+    }
+
+    _attach_bundle_plan_block(payload, block)
+
+    assert payload["bundle_plans"]["result_status"] == "unavailable"
+    assert payload["bundle_plans"]["plans"] == []
+    assert "组合方案校验未通过" in payload["bundle_plans"]["unavailable_reason"]
+
+
+def test_valid_bundle_block_is_attached_unchanged():
+    payload: dict[str, Any] = {
+        "structured_directions": [{"canonical_name": BUNDLE_CANONICAL}]
+    }
+    block = _bundle_stage_payload()
+
+    _attach_bundle_plan_block(payload, block)
+
+    assert payload["bundle_plans"] is block
+
+
+@pytest.mark.asyncio
+async def test_bundle_stage_does_not_add_artifacts(
+    browser: FakeBrowser, store: FakeStore, service_factory: Any
+):
+    llm = FakeBundlePlanLLM(_v21_result([_v21_direction()]), _bundle_stage_payload())
+
+    result = await AnalysisRunner(store=store).run_hypothesis(
+        url="https://www.walmart.com/ip/test/12345",
+        browser=browser,
+        llm=llm,
+        expected_model_version="combination_model_v2.1",
+        product_service_factory=service_factory,
+    )
+
+    assert [artifact.kind for artifact in result.artifacts] == ["json", "excel"]
