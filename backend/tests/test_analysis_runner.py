@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from pathlib import Path
+from types import SimpleNamespace
 from typing import Any
 from unittest.mock import AsyncMock
 
@@ -25,6 +26,7 @@ from backend.application.analysis_runner import (
     _build_cross_review_prompt,
     _serialize_b_products,
     _serialize_hypothesis,
+    _validate_judgment_coverage,
 )
 from backend.application.result_quality import ResultQualityError
 
@@ -365,6 +367,7 @@ async def test_runner_judges_only_non_food_b_and_keeps_food_rejection(
     llm = FakeLLM(
         {
             "alignment_review": [],
+            "veto_check": {"per_b_product": {"Camera Bag": {"vetoed": False}}},
             "final_grade": "A",
             "priority_score": 80,
         }
@@ -680,7 +683,7 @@ async def test_runner_judgment_dispatch(
             "alignment_review": [],
             "motivation_review": {},
             "price_calculation": {},
-            "veto_check": {},
+            "veto_check": {"per_b_product": {"Water Bottle": {"vetoed": False}}},
             "c_score": {},
             "b_score": {},
             "final_grade": "A",
@@ -1329,6 +1332,137 @@ async def test_batch_bundle_failure_on_one_item_does_not_abort_the_batch(
     item = result.result_payload["results"][0]
     assert item["bundle_plans"]["result_status"] == "unavailable"
     assert item["result_status"] != "failed"
+
+
+def _judgment_result(**overrides: Any) -> Any:
+    defaults: dict[str, Any] = {"alignment_review": [], "veto_check": {}}
+    defaults.update(overrides)
+    return SimpleNamespace(**defaults)
+
+
+def test_judgment_coverage_accepts_a_report_naming_every_product():
+    result = _judgment_result(
+        alignment_review=[
+            {"product_b": "Huffy Bike"},
+            {"product_b": "Concord Helmet"},
+        ]
+    )
+
+    _validate_judgment_coverage(
+        result,
+        [ProductDTO(title="Huffy Bike"), ProductDTO(title="Concord Helmet")],
+    )
+
+
+def test_judgment_coverage_rejects_a_dropped_b_product():
+    """Reproduces a real run: two B products submitted, only one judged."""
+    result = _judgment_result(
+        veto_check={"per_b_product": {"Concord Helmet": {"vetoed": False}}}
+    )
+
+    with pytest.raises(ResultQualityError, match="1 of 2"):
+        _validate_judgment_coverage(
+            result,
+            [ProductDTO(title="Huffy Bike"), ProductDTO(title="Concord Helmet")],
+        )
+
+
+def test_judgment_coverage_counts_any_section_that_names_the_product():
+    """A product only present in one per-B section still counts as covered."""
+    result = _judgment_result(
+        alignment_review=[{"product_b": "Huffy Bike"}],
+        price_calculation={"per_b_product": {"Concord Helmet": {"a_price": 1}}},
+    )
+
+    _validate_judgment_coverage(
+        result,
+        [ProductDTO(title="Huffy Bike"), ProductDTO(title="Concord Helmet")],
+    )
+
+
+def test_judgment_coverage_ignores_blank_names():
+    result = _judgment_result(
+        alignment_review=[{"product_b": "   "}, {"product_b": "Huffy Bike"}]
+    )
+
+    with pytest.raises(ResultQualityError, match="1 of 2"):
+        _validate_judgment_coverage(
+            result,
+            [ProductDTO(title="Huffy Bike"), ProductDTO(title="Concord Helmet")],
+        )
+
+
+@pytest.mark.asyncio
+async def test_runner_fails_when_the_judgment_drops_a_b_product(store: FakeStore):
+    """The omitted product must fail the job rather than quietly thin the report."""
+
+    class TwoBService(TitledProductService):
+        async def get_product(self, url: str) -> ProductDTO:
+            if "/a/" in url:
+                return ProductDTO(url=url, title="Main Bike", price="$200.00")
+            if "helmet" in url:
+                return ProductDTO(url=url, title="Concord Helmet", price="$30.00")
+            return ProductDTO(url=url, title="Huffy Bike", price="$180.00")
+
+    llm = FakeLLM(
+        {
+            "alignment_review": [],
+            "veto_check": {"per_b_product": {"Concord Helmet": {"vetoed": False}}},
+            "final_grade": "A",
+        }
+    )
+
+    with pytest.raises(ResultQualityError, match="1 of 2"):
+        await AnalysisRunner(store=store).run_judgment(
+            a_url="https://walmart.com/ip/a/1",
+            b_urls=[
+                "https://walmart.com/ip/b/helmet",
+                "https://walmart.com/ip/b/huffy",
+            ],
+            browser=FakeBrowser(),
+            llm=llm,
+            product_service_factory=TwoBService,
+        )
+
+
+@pytest.mark.asyncio
+async def test_runner_accepts_a_judgment_that_covers_every_b_product(
+    store: FakeStore,
+):
+    class TwoBService(TitledProductService):
+        async def get_product(self, url: str) -> ProductDTO:
+            if "/a/" in url:
+                return ProductDTO(url=url, title="Main Bike", price="$200.00")
+            if "helmet" in url:
+                return ProductDTO(url=url, title="Concord Helmet", price="$30.00")
+            return ProductDTO(url=url, title="Huffy Bike", price="$180.00")
+
+    llm = FakeLLM(
+        {
+            "alignment_review": [],
+            "veto_check": {
+                "per_b_product": {
+                    "Concord Helmet": {"vetoed": False},
+                    "Huffy Bike": {"vetoed": True},
+                }
+            },
+            "final_grade": "C",
+        }
+    )
+
+    result = await AnalysisRunner(store=store).run_judgment(
+        a_url="https://walmart.com/ip/a/1",
+        b_urls=[
+            "https://walmart.com/ip/b/helmet",
+            "https://walmart.com/ip/b/huffy",
+        ],
+        browser=FakeBrowser(),
+        llm=llm,
+        product_service_factory=TwoBService,
+    )
+
+    assert result.result_payload["grade"].startswith("C")
+    assert result.result_payload["rejected_b_products"] == []
 
 
 def test_invalid_bundle_block_degrades_instead_of_failing_the_job():

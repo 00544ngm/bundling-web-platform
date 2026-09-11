@@ -323,6 +323,9 @@ class AnalysisRunner:
                 report_progress,
                 single_progress=90,
             )
+            _validate_judgment_coverage(result, products_b)
+            if result2 is not None:
+                _validate_judgment_coverage(result2, products_b)
 
             payload = _serialize_judgment(
                 result, product_a=product_a, products_b=products_b
@@ -833,6 +836,60 @@ def _fmt(d: Any) -> str:
     if isinstance(d, list):
         return "\n".join(f"  - {_fmt(item)}" for item in d)
     return str(d)
+
+
+_JUDGMENT_PER_B_FIELDS = (
+    "motivation_review",
+    "price_calculation",
+    "veto_check",
+    "c_score",
+    "b_score",
+    "user_rationality",
+    "delivery_package",
+)
+
+
+def _judgment_covered_products(result: Any) -> set[str]:
+    """Distinct B products the judgment model actually addressed."""
+    covered: set[str] = set()
+
+    def add(value: Any) -> None:
+        if isinstance(value, str):
+            normalized = "".join(char.casefold() for char in value if char.isalnum())
+            if normalized:
+                covered.add(normalized)
+
+    alignment_review = getattr(result, "alignment_review", None)
+    if isinstance(alignment_review, list):
+        for entry in alignment_review:
+            if isinstance(entry, dict):
+                add(entry.get("product_b"))
+
+    for section_name in _JUDGMENT_PER_B_FIELDS:
+        section = getattr(result, section_name, None)
+        per_b_product = section.get("per_b_product") if isinstance(section, dict) else None
+        if isinstance(per_b_product, dict):
+            for name in per_b_product:
+                add(name)
+
+    return covered
+
+
+def _validate_judgment_coverage(result: Any, products_b: list[ProductDTO]) -> None:
+    """Require the judgment to address every submitted B product.
+
+    A real run judged one of two B products and, because the omitted one was
+    the competitor that would have sunk the bundle, reported a *better* grade.
+    A silent omission is therefore treated as a quality failure, not as a
+    slightly thinner report: the job fails and model rotation can retry.
+    """
+    expected = len(products_b)
+    covered = _judgment_covered_products(result)
+    if len(covered) < expected:
+        raise ResultQualityError(
+            "judgment covered "
+            f"{len(covered)} of {expected} submitted B products"
+        )
 
 
 async def _build_bundle_plan_block(
