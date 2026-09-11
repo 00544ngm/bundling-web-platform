@@ -59,6 +59,8 @@ const decisionLabels: LabelMap = {
   not_recommended: "不建议",
   observe: "观察",
   needs_evidence: "需要证据",
+  // Same "not verified yet" state as needs_evidence, but worth verifying first.
+  needs_evidence_priority: "优先补证据",
   small_batch_test: "小批量测试",
   priority_test: "优先测试",
   focus_development: "重点开发",

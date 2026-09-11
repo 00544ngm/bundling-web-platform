@@ -2,6 +2,7 @@
 
 import { useState } from "react";
 import { Copy, ExternalLink } from "lucide-react";
+import { writeToClipboard } from "@/lib/clipboard";
 import { amazonSearchUrl, normalizeDirectionKeywords } from "@/lib/direction-keywords";
 
 type CopyState = "idle" | "copied" | "failed";
@@ -22,12 +23,7 @@ export default function DirectionKeywordAccordions({ keywords }: { keywords: unk
     setState: (state: CopyState) => void
   ) => {
     if (!value) return;
-    try {
-      await navigator.clipboard.writeText(value);
-      setState("copied");
-    } catch {
-      setState("failed");
-    }
+    setState((await writeToClipboard(value)) ? "copied" : "failed");
   };
 
   return (
